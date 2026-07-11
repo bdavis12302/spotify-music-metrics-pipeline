@@ -1,0 +1,5 @@
+﻿.cache
+pipeline.log*
+__pycache__/
+*.pyc
+.env

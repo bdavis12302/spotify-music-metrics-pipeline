@@ -1,0 +1,8 @@
+﻿
+pandas==3.0.3
+pyodbc==5.3.0
+requests==2.34.2
+spotipy==2.26.0
+SQLAlchemy==2.0.51
+
+
