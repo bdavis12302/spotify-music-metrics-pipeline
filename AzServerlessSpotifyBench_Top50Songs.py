@@ -79,6 +79,25 @@ def warm_up(engine, retries=5, delay=30):
             logger.warning(f"Waking up database... attempt {attempt + 1}")
             time.sleep(delay)
 
+# Log the date and time of a data refresh of the passed variable table.
+def log_data_refresh(engine, table_name):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'table_refresh_log')
+            CREATE TABLE table_refresh_log (
+                table_name NVARCHAR(100) PRIMARY KEY,
+                refreshed_at_utc DATETIME2(3)
+            )
+        """))
+        conn.execute(text("""
+            MERGE table_refresh_log AS target
+            USING (SELECT :name AS table_name) AS source
+            ON target.table_name = source.table_name
+            WHEN MATCHED THEN UPDATE SET refreshed_at_utc = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (table_name, refreshed_at_utc) 
+                VALUES (:name, SYSUTCDATETIME());
+    """), {"name": table_name})
+
 def create_and_push_recent_played_table(spotify, engine):
     # Pull last 50 recently played tracks
     results = spotify.current_user_recently_played(limit=50)
@@ -87,7 +106,7 @@ def create_and_push_recent_played_table(spotify, engine):
     for item in results['items']:
         track = item['track']
         tracks.append({
-        'played_at': item['played_at'],
+        'played_at_utc': item['played_at'],
         'track_name': track['name'],
         'artist': track['artists'][0]['name'],
         'artist_id': track['artists'][0]['id'],
@@ -105,9 +124,6 @@ def create_and_push_recent_played_table(spotify, engine):
     
     # Convert to DataFrame
     df = pd.DataFrame(tracks)
-    df = df.rename(columns={
-        'played_at': 'played_at_utc',
-    })
     df['duration_min'] = df['duration_ms'] / 60000
     df['played_at_utc'] = pd.to_datetime(df['played_at_utc'], utc=True)
     df['played_at_minute_utc'] = df['played_at_utc'].dt.floor('min')
@@ -320,6 +336,7 @@ def create_and_push_spotify_top_tracks(spotify, engine):
             ON top_tracks (time_range, artist_id, track_id)
             INCLUDE (rank, track_name, artist, duration_ms, duration_min, explicit)
         """))
+        log_data_refresh(engine, 'top_tracks')
     
 def create_and_push_spotify_top_artists(spotify, engine):
     top_artists = []
@@ -361,6 +378,7 @@ def create_and_push_spotify_top_artists(spotify, engine):
             ON top_artists (time_range, artist_id)
             INCLUDE (rank, artist, artist_image_url)
         """))
+        log_data_refresh(engine, 'top_artists')
 
 def create_and_push_current_playback(spotify, engine):
     current = spotify.current_playback()
@@ -542,7 +560,7 @@ def main():
 
         if not args.dry_run:
             # Affinity rankings drift over weeks — weekly refresh on Mondays
-            if pd.Timestamp.now().dayofweek == 0: # Monday
+            if pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
                 create_and_push_spotify_top_tracks(spotify, engine)
                 create_and_push_spotify_top_artists(spotify, engine)
             else:
@@ -567,7 +585,7 @@ def main():
                 lifts_at = datetime.now() + timedelta(seconds=wait)
                 logger.warning(
                     f"Rate limited by Spotify — penalty {timedelta(seconds=wait)} "
-                    f"(lifts ~{lifts_at:%Y-%m-%d %H:%M}). Exiting cleanly. {str(e).replace(chr(10), ' | ')}"
+                    f"(lifts ~{lifts_at:%Y-%m-%d %H:%M}) MT. Exiting cleanly. {str(e).replace(chr(10), ' | ')}"
                 )
             else:
                 logger.warning(f"Rate limited by Spotify — exiting cleanly. {e}")
