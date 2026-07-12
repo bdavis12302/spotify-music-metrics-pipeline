@@ -3,6 +3,7 @@ SELECT * FROM listening_history
 SELECT * FROM artist_genres
 SELECT * FROM top_tracks
 SELECT * FROM top_artists
+select * from table_refresh_log
 select * from available_devices
 select * from current_playback
 select * from play_queue
@@ -20,6 +21,7 @@ sp_helpindex top_artists
 sp_helpindex available_devices
 sp_helpindex current_playback
 sp_helpindex play_queue
+sp_helpindex table_refresh_log
 
 SELECT * FROM listening_history --WITH(INDEX(listening_history_played_at_idx))
 ORDER BY played_at_utc DESC
