@@ -29,6 +29,9 @@ ORDER BY played_at_utc DESC
 ALTER INDEX ALL ON listening_history REBUILD
 update statistics listening_history with FULLSCAN
 
+ALTER INDEX ALL ON artist_genres REBUILD
+update statistics artist_genres with FULLSCAN
+
 CREATE CLUSTERED INDEX clustered_listening_history_played_at_utc_idx
 ON listening_history (played_at_utc DESC)
 
@@ -43,12 +46,38 @@ ON recently_played (played_at_utc DESC)
 INCLUDE (track_name, artist, duration_ms, duration_min, explicit)
 
 SELECT * FROM sys.indexes 
-WHERE object_id = OBJECT_ID('recently_played')
+WHERE object_id = OBJECT_ID('artist_genres')
 
-SELECT artist_id, artist, COUNT(*) AS genre_count
-FROM artist_genres
-GROUP BY artist_id, artist
-HAVING COUNT(*) >= 5
-
+SELECT genre, TEMP.*  FROM artist_genres JOIN (
+    SELECT artist_id, artist, COUNT(*) AS genre_count
+    FROM artist_genres
+    GROUP BY artist_id, artist
+    HAVING COUNT(*) = 1) AS TEMP
+    ON artist_genres.artist_id = temp.artist_id
+    
 SELECT MIN(album_release_date) AS oldest, MAX(album_release_date) AS newest
 FROM listening_history
+
+
+SELECT artist_id, artist FROM (
+                SELECT DISTINCT artist_id, artist FROM listening_history
+                UNION
+                SELECT DISTINCT artist_id, artist FROM top_artists
+                UNION
+                SELECT DISTINCT artist_id, artist FROM top_tracks
+            ) all_artists
+            WHERE artist_id NOT IN (SELECT DISTINCT artist_id FROM artist_genres)
+
+            SELECT * FROM artist_genres
+
+SELECT artist_id, artist FROM (
+            SELECT DISTINCT artist_id, artist FROM artist_genres    
+            ) all_artists
+            WHERE artist_id NOT IN (
+            
+            SELECT DISTINCT artist_id FROM listening_history
+                UNION
+                SELECT DISTINCT artist_id FROM top_artists
+                UNION
+                SELECT DISTINCT artist_id FROM top_tracks
+            )

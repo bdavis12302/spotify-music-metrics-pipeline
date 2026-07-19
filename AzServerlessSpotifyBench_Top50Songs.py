@@ -66,7 +66,14 @@ spotipy_logger.setLevel(logging.WARNING)
 parser = argparse.ArgumentParser()
 parser.add_argument('--dry-run', action='store_true',
                     help='Skip all Spotify/Last.fm calls; exercise logging, SQL, and control flow only.')
+parser.add_argument('--full', action='store_true',
+                    help='Run full script including forced refresh of top tracks/artists.')
+parser.add_argument('--skip-warmup', action='store_true',
+                    help='Skip the database warmup.')
 args = parser.parse_args()
+
+if args.full and args.dry_run:
+    parser.error("Arguments --full and --dry-run are contradictory: full forces API calls, dry-run disallows them.")
 
 # Warm up the database from cold start.
 def warm_up(engine, retries=5, delay=30):
@@ -245,7 +252,7 @@ def push_to_artist_genres(engine, LASTFM_API_KEY):
                 UNION
                 SELECT DISTINCT artist_id, artist FROM top_tracks
             ) all_artists
-            WHERE artist_id NOT IN (SELECT artist_id FROM artist_genres)
+            WHERE artist_id NOT IN (SELECT DISTINCT artist_id FROM artist_genres)
             """))
         new_artists_df = pd.DataFrame(result.fetchall(), columns=['artist_id', 'artist'])
     
@@ -531,7 +538,11 @@ def main():
             pool_pre_ping=True,
             pool_reset_on_return='rollback'
         )
-        warm_up(engine)
+
+        if not args.skip_warmup:
+            warm_up(engine)
+        else:
+            logger.info("Skipping database warmup.")
 
         # Connect to Spotify
         sp = SpotifyOAuth(
@@ -547,24 +558,26 @@ def main():
             backoff_factor=0
         )
 
-        if args.dry_run:
+        if not args.dry_run:
+            df = create_and_push_recent_played_table(spotify, engine)
+        else:
             logger.info("*** DRY RUN — no API calls! ***")
             df = pd.read_sql("SELECT * FROM recently_played", engine)
-        else:
-            df = create_and_push_recent_played_table(spotify, engine)
+            logger.info("Retrieved all records from recently_played on AzServerlessSpotifyBench.")
         
         create_history_table(df, engine)
         push_to_history(df, engine)
         create_artist_genres_table(engine)
-        push_to_artist_genres(engine, LASTFM_API_KEY)
 
         if not args.dry_run:
+            push_to_artist_genres(engine, LASTFM_API_KEY)
+
             # Affinity rankings drift over weeks — weekly refresh on Mondays
-            if pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
+            if args.full or pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
                 create_and_push_spotify_top_tracks(spotify, engine)
                 create_and_push_spotify_top_artists(spotify, engine)
             else:
-                logger.info("Skipping top tracks/artists (weekly refresh on Mondays)")
+                logger.info("Skipping top tracks/artists (weekly refresh on Mondays UTC).")
             
             create_and_push_current_playback(spotify, engine)
             create_and_push_play_queue(spotify, engine)
