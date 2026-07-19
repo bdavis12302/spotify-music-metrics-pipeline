@@ -66,7 +66,14 @@ spotipy_logger.setLevel(logging.WARNING)
 parser = argparse.ArgumentParser()
 parser.add_argument('--dry-run', action='store_true',
                     help='Skip all Spotify/Last.fm calls; exercise logging, SQL, and control flow only.')
+parser.add_argument('--full', action='store_true',
+                    help='Run full script including forced refresh of top tracks/artists.')
+parser.add_argument('--skip-warmup', action='store_true',
+                    help='Skip the database warmup.')
 args = parser.parse_args()
+
+if args.full and args.dry_run:
+    parser.error("Arguments --full and --dry-run are contradictory: full forces API calls, dry-run disallows them.")
 
 # Warm up the database from cold start.
 def warm_up(engine, retries=5, delay=30):
@@ -531,7 +538,11 @@ def main():
             pool_pre_ping=True,
             pool_reset_on_return='rollback'
         )
-        warm_up(engine)
+
+        if not args.skip_warmup:
+            warm_up(engine)
+        else:
+            logger.info("Skipping database warmup.")
 
         # Connect to Spotify
         sp = SpotifyOAuth(
@@ -562,11 +573,11 @@ def main():
             push_to_artist_genres(engine, LASTFM_API_KEY)
 
             # Affinity rankings drift over weeks — weekly refresh on Mondays
-            if pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
+            if args.full or pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
                 create_and_push_spotify_top_tracks(spotify, engine)
                 create_and_push_spotify_top_artists(spotify, engine)
             else:
-                logger.info("Skipping top tracks/artists (weekly refresh on Mondays UTC)")
+                logger.info("Skipping top tracks/artists (weekly refresh on Mondays UTC).")
             
             create_and_push_current_playback(spotify, engine)
             create_and_push_play_queue(spotify, engine)
