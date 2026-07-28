@@ -68,12 +68,20 @@ parser.add_argument('--dry-run', action='store_true',
                     help='Skip all Spotify/Last.fm calls; exercise logging, SQL, and control flow only.')
 parser.add_argument('--full', action='store_true',
                     help='Run full script including forced refresh of top tracks/artists.')
+parser.add_argument('--skip-top', action='store_true',
+                    help='Skip the refresh of top tracks/artists.')
 parser.add_argument('--skip-warmup', action='store_true',
                     help='Skip the database warmup.')
 args = parser.parse_args()
 
 if args.full and args.dry_run:
     parser.error("Arguments --full and --dry-run are contradictory: full forces API calls, dry-run disallows them.")
+
+if args.full and args.skip_top:
+    parser.error("Arguments --full and --skip-top are contradictory: full forces API calls, skip-top disallows top tracks/artists API calls.")
+
+if args.dry_run and args.skip_top:
+    parser.error("Arguments --dry-run and --skip-top are contradictory: dry-run already disallows all API calls.")
 
 # Warm up the database from cold start.
 def warm_up(engine, retries=5, delay=30):
@@ -573,7 +581,7 @@ def main():
             push_to_artist_genres(engine, LASTFM_API_KEY)
 
             # Affinity rankings drift over weeks — weekly refresh on Mondays
-            if args.full or pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0:
+            if args.full or (pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0 and not args.skip_top):
                 create_and_push_spotify_top_tracks(spotify, engine)
                 create_and_push_spotify_top_artists(spotify, engine)
             else:
