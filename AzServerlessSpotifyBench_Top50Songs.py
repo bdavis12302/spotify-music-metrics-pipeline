@@ -12,8 +12,10 @@ import os
 import sys
 import logging
 import argparse
+import io
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 
 class RetryAfterCapture(logging.Filter):
     """Sniffs spotipy's rate-limit log line and stashes the retry-after seconds."""
@@ -37,32 +39,17 @@ SQL_DTYPES = {
 }
 
 # LOGGING SETUP
-LOG_PATH = r"C:\Users\blake\OneDrive\Desktop\AzServerlessSpotifyBench\pipeline.log"
-
-file_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
-file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(funcName)s: %(message)s"
-))
-
-console = logging.StreamHandler()
-console.setFormatter(logging.Formatter("%(message)s"))
-
-# Root gets the handlers — everyone inherits
-root = logging.getLogger()
-root.setLevel(logging.WARNING)
-root.addHandler(file_handler)
-root.addHandler(console)
-
-retry_capture = RetryAfterCapture()
-file_handler.addFilter(retry_capture)
-
-logger = logging.getLogger("AzServerlessSpotifyBench_Top50Songs")
+LOG_PATH = r"C:\Users\blake\OneDrive\Desktop\AzServerlessSpotifyBench\AzServerlessSpotifyBench_Pipeline.log"
+CLAUDE_LOG_PATH = r"C:\Users\blake\OneDrive\Desktop\AzServerlessSpotifyBench\AzSpotifyClaude\AzServerlessSpotifyBench_Pipeline_Claude.log"
+LOGGER_NAME = "AzServerlessSpotifyBench"
+FMT         = "%(asctime)s [%(levelname)s] %(funcName)s: %(message)s"
+CLAUDE_FMT  = "[CLAUDE_MODE] " + FMT
+logger = logging.getLogger(LOGGER_NAME)
 logger.setLevel(logging.INFO)
+private = logging.getLogger("AzServerlessSpotifyBench_ExceptionLog")
+private.setLevel(logging.INFO)
 
-spotipy_logger = logging.getLogger('spotipy')
-spotipy_logger.setLevel(logging.WARNING)
-
-# API PARAMETER SWITCH (ON/OFF)
+# Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--dry-run', action='store_true',
                     help='Skip all Spotify/Last.fm calls; exercise logging, SQL, and control flow only.')
@@ -72,6 +59,8 @@ parser.add_argument('--skip-top', action='store_true',
                     help='Skip the refresh of top tracks/artists.')
 parser.add_argument('--skip-warmup', action='store_true',
                     help='Skip the database warmup.')
+parser.add_argument('--claude_mode', action='store_true',
+                    help='Use when script is called by Claude.')
 args = parser.parse_args()
 
 if args.full and args.dry_run:
@@ -82,6 +71,55 @@ if args.full and args.skip_top:
 
 if args.dry_run and args.skip_top:
     parser.error("Arguments --dry-run and --skip-top are contradictory: dry-run already disallows all API calls.")
+
+
+def setup_logging(claude_mode: bool):
+    file_handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
+    file_handler.setFormatter(
+        logging.Formatter(CLAUDE_FMT if claude_mode else FMT)
+    )
+    retry_capture = RetryAfterCapture()
+    file_handler.addFilter(retry_capture)
+
+    #Set up buffer for Claude
+    claude_buf = io.StringIO()
+    claude_handler = logging.StreamHandler(claude_buf)
+    claude_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(funcName)s: %(message)s"
+    ))
+
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter("%(message)s"))
+
+    # Root gets the handlers — everyone inherits
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    root.addHandler(file_handler)
+    root.addHandler(console)
+
+    # setup_logging returns an object instance of the retry_capture class to capture for error handling. 
+    return retry_capture
+
+@contextmanager
+def claude_log(claude_mode: bool):
+    # Do not open the Google Drive file if not run by Claude
+    if not claude_mode:
+        yield
+        return
+
+    claude_buf = io.StringIO()
+    claude_buf_handler = logging.StreamHandler(claude_buf)
+    claude_buf_handler.setFormatter(logging.Formatter(CLAUDE_FMT))
+    logger.addHandler(claude_buf_handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(claude_buf_handler)
+        status = "FAILED" if sys.exc_info()[0] else "SUCCESS"
+        with open(CLAUDE_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"[CLAUDE_MODE] RUN STATUS: {status}\n")
+            f.write(claude_buf.getvalue())
 
 # Warm up the database from cold start.
 def warm_up(engine, retries=5, delay=30):
@@ -140,7 +178,8 @@ def create_and_push_recent_played_table(spotify, engine):
     # Convert to DataFrame
     df = pd.DataFrame(tracks)
     df['duration_min'] = df['duration_ms'] / 60000
-    df['played_at_utc'] = pd.to_datetime(df['played_at_utc'], utc=True)
+    #df['played_at_utc'] = pd.to_datetime(df['played_at_utc'], utc=True) -- Bug: Requires format specification.
+    df['played_at_utc'] = pd.to_datetime(df['played_at_utc'], format='ISO8601', utc=True)
     df['played_at_minute_utc'] = df['played_at_utc'].dt.floor('min')
     df['played_at_hour_utc'] = df['played_at_utc'].dt.floor('h')
     df['played_at_date_utc'] = df['played_at_utc'].dt.date
@@ -441,6 +480,8 @@ def create_and_push_current_playback(spotify, engine):
             ADD CONSTRAINT PK_current_playback PRIMARY KEY (observed_at_utc)
         """))
     logger.info(f"Now playing: {row['track_name']} — {row['artist']} (on {row['device_name']})")
+    if args.claude_mode:
+        logger.info("Cover: %s", track['album']['images'][0]['url'] if track['album']['images'] else None)
 
 def create_and_push_play_queue(spotify, engine):
     queue = spotify.queue()
@@ -519,108 +560,114 @@ def create_and_push_available_devices(spotify, engine):
 
 def main():
     start = time.perf_counter()
-    logger.info("=" * 50)
-    logger.info("Pipeline run starting: ")
-    try:
-        # Spotify credentials
-        SPOTIPY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
-        SPOTIPY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
-        SPOTIPY_REDIRECT_URI = os.environ.get('SPOTIFY_REDIRECT_URI')
-        LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
+    
+    # setup_logging returns an object instance of the retry_capture class to capture for error handling. 
+    retry_capture = setup_logging(args.claude_mode)
+    with claude_log(args.claude_mode):
+        logger.info("=" * 50)
+        logger.info("Pipeline run starting: ")
 
-        # Azure SQL credentials
-        server = os.environ.get('AZURE_SQL_SERVER')
-        database = os.environ.get('AZURE_SQL_DATABASE')
-        username = os.environ.get('AZURE_SQL_USERNAME')
-        password = os.environ.get('AZURE_SQL_PASSWORD')
+        try:
+            # Spotify credentials
+            SPOTIPY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
+            SPOTIPY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
+            SPOTIPY_REDIRECT_URI = os.environ.get('SPOTIFY_REDIRECT_URI')
+            LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
 
-        # Connect to Azure SQL
-        params = urllib.parse.quote_plus(
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={server};DATABASE={database};"
-            f"UID={username};PWD={password}"
-        )
-        engine = create_engine(
-            f"mssql+pyodbc:///?odbc_connect={params}",
-            fast_executemany=True,
-            pool_pre_ping=True,
-            pool_reset_on_return='rollback'
-        )
+            # Azure SQL credentials
+            server = os.environ.get('AZURE_SQL_SERVER')
+            database = os.environ.get('AZURE_SQL_DATABASE')
+            username = os.environ.get('AZURE_SQL_USERNAME')
+            password = os.environ.get('AZURE_SQL_PASSWORD')
 
-        if not args.skip_warmup:
-            warm_up(engine)
-        else:
-            logger.info("Skipping database warmup.")
+            # Connect to Azure SQL
+            params = urllib.parse.quote_plus(
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                f"SERVER={server};DATABASE={database};"
+                f"UID={username};PWD={password}"
+            )
+            engine = create_engine(
+                f"mssql+pyodbc:///?odbc_connect={params}",
+                fast_executemany=True,
+                pool_pre_ping=True,
+                pool_reset_on_return='rollback'
+            )
 
-        # Connect to Spotify
-        sp = SpotifyOAuth(
-            client_id=SPOTIPY_CLIENT_ID,
-            client_secret=SPOTIPY_CLIENT_SECRET,
-            redirect_uri=SPOTIPY_REDIRECT_URI,
-            scope="user-read-recently-played,user-read-playback-state,user-top-read"
-        )
-        spotify = spotipy.Spotify(
-            auth_manager=sp,
-            retries=0,
-            status_retries=0,
-            backoff_factor=0
-        )
-
-        if not args.dry_run:
-            df = create_and_push_recent_played_table(spotify, engine)
-        else:
-            logger.info("*** DRY RUN — no API calls! ***")
-            df = pd.read_sql("SELECT * FROM recently_played", engine)
-            logger.info("Retrieved all records from recently_played on AzServerlessSpotifyBench.")
-        
-        create_history_table(df, engine)
-        push_to_history(df, engine)
-        create_artist_genres_table(engine)
-
-        if not args.dry_run:
-            push_to_artist_genres(engine, LASTFM_API_KEY)
-
-            # Affinity rankings drift over weeks — weekly refresh on Mondays
-            if args.full or (pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0 and not args.skip_top):
-                create_and_push_spotify_top_tracks(spotify, engine)
-                create_and_push_spotify_top_artists(spotify, engine)
+            if not args.skip_warmup:
+                warm_up(engine)
             else:
-                logger.info("Skipping top tracks/artists (weekly refresh on Mondays UTC).")
+                logger.info("Skipping database warmup.")
+
+            # Connect to Spotify
+            sp = SpotifyOAuth(
+                client_id=SPOTIPY_CLIENT_ID,
+                client_secret=SPOTIPY_CLIENT_SECRET,
+                redirect_uri=SPOTIPY_REDIRECT_URI,
+                scope="user-read-recently-played,user-read-playback-state,user-top-read"
+            )
+            spotify = spotipy.Spotify(
+                auth_manager=sp,
+                retries=0,
+                status_retries=0,
+                backoff_factor=0
+            )
+
+            if not args.dry_run:
+                df = create_and_push_recent_played_table(spotify, engine)
+            else:
+                logger.info("*** DRY RUN — no API calls! ***")
+                df = pd.read_sql("SELECT * FROM recently_played", engine)
+                logger.info("Retrieved all records from recently_played on AzServerlessSpotifyBench.")
             
-            create_and_push_current_playback(spotify, engine)
-            create_and_push_play_queue(spotify, engine)
-            create_and_push_available_devices(spotify, engine)
+            create_history_table(df, engine)
+            push_to_history(df, engine)
+            create_artist_genres_table(engine)
+
+            if not args.dry_run:
+                push_to_artist_genres(engine, LASTFM_API_KEY)
+
+                # Affinity rankings drift over weeks — weekly refresh on Mondays
+                if args.full or (pd.Timestamp.now(timezone.utc).floor('s').tz_localize(None).dayofweek == 0 and not args.skip_top):
+                    create_and_push_spotify_top_tracks(spotify, engine)
+                    create_and_push_spotify_top_artists(spotify, engine)
+                else:
+                    logger.info("Skipping top tracks/artists (weekly refresh on Mondays UTC).")
+                
+                create_and_push_current_playback(spotify, engine)
+                create_and_push_play_queue(spotify, engine)
+                create_and_push_available_devices(spotify, engine)
 
 
-        logger.info(f"Pipeline completed in {time.perf_counter() - start:.3f}s")
+            logger.info(f"Pipeline completed in {time.perf_counter() - start:.3f}s")
 
-    except SpotifyException as e:
-        if e.http_status == 429:
-            retry_after = None
-            if getattr(e, 'headers', None):
-                retry_after = e.headers.get('Retry-After')
-            if retry_after is None:
-                retry_after = retry_capture.retry_after   # ← sniffed from spotipy's own log line
-            if retry_after:
-                wait = int(retry_after)
-                lifts_at = datetime.now() + timedelta(seconds=wait)
-                logger.warning(
-                    f"Rate limited by Spotify — penalty {timedelta(seconds=wait)} "
-                    f"(lifts ~{lifts_at:%Y-%m-%d %H:%M}) MT. Exiting cleanly. {str(e).replace(chr(10), ' | ')}"
-                )
-            else:
-                logger.warning(f"Rate limited by Spotify — exiting cleanly. {e}")
-            # no Task Scheduler retry, no penalty extension - Spotify Rate Limiting
-            sys.exit(0)
-        raise
+        except SpotifyException as e:
+            if e.http_status == 429:
+                retry_after = None
+                if getattr(e, 'headers', None):
+                    retry_after = e.headers.get('Retry-After')
+                if retry_after is None:
+                    retry_after = retry_capture.retry_after   # ← sniffed from spotipy's own log line
+                if retry_after:
+                    wait = int(retry_after)
+                    lifts_at = datetime.now() + timedelta(seconds=wait)
+                    logger.warning(
+                        f"Rate limited by Spotify — penalty {timedelta(seconds=wait)} "
+                        f"(lifts ~{lifts_at:%Y-%m-%d %H:%M}) MT. Exiting cleanly. {str(e).replace(chr(10), ' | ')}"
+                    )
+                else:
+                    logger.warning(f"Rate limited by Spotify — exiting cleanly. {e}")
+                # no Task Scheduler retry, no penalty extension - Spotify Rate Limiting
+                sys.exit(0)
+            raise
 
-    except Exception as e:
-        logger.exception(f"PIPELINE FAILED:")
-        # Signal Task Scheduler to retry
-        sys.exit(1)
+        except Exception as e:
+            logging.getLogger("AzServerlessSpotifyBench_ExceptionLog").exception("PIPELINE FAILED:")
+            logger.error("PIPELINE FAILED: %s", type(e).__name__)
+            # Signal Task Scheduler to retry
+            sys.exit(1)
 
-    finally:
-        logger.info("—— end of run ——\n")
+        finally:
+            logger.info("=" * 50 + "\n")
 
 if __name__ == "__main__":
     main()
