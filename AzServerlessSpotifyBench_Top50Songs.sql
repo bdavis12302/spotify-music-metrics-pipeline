@@ -12,7 +12,7 @@ CREATE INDEX covering_listening_history_played_at_utc_idx
 ON listening_history (played_at_utc DESC)
 INCLUDE (track_name, artist, duration_ms, duration_min, explicit)
 
-DROP INDEX covering_listening_history_played_at_utc_idx ON listening_history
+--DROP INDEX covering_listening_history_played_at_utc_idx ON listening_history
 sp_helpindex recently_played
 sp_helpindex artist_genres
 sp_helpindex listening_history
@@ -30,6 +30,27 @@ ALTER INDEX ALL ON listening_history REBUILD
 update statistics listening_history with FULLSCAN
 
 ALTER INDEX ALL ON artist_genres REBUILD
+update statistics artist_genres with FULLSCAN
+
+ALTER INDEX ALL ON top_tracks REBUILD
+update statistics listening_history with FULLSCAN
+
+ALTER INDEX ALL ON top_artists REBUILD
+update statistics artist_genres with FULLSCAN
+
+ALTER INDEX ALL ON current_playback REBUILD
+update statistics listening_history with FULLSCAN
+
+ALTER INDEX ALL ON table_refresh_log REBUILD
+update statistics artist_genres with FULLSCAN
+
+ALTER INDEX ALL ON play_queue REBUILD
+update statistics listening_history with FULLSCAN
+
+ALTER INDEX ALL ON available_devices REBUILD
+update statistics artist_genres with FULLSCAN
+
+ALTER INDEX ALL ON recently_played REBUILD
 update statistics artist_genres with FULLSCAN
 
 CREATE CLUSTERED INDEX clustered_listening_history_played_at_utc_idx
